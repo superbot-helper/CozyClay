@@ -15,6 +15,9 @@ import { STUDIO_TOOL_SCHEMAS, StudioSchemas } from '../studio-agent-protocol.js'
 import { elementSetSchema, registerElementSet } from './elements.js';
 import './elements/shot.js';
 import { changedIds, fail, shotLabel } from './shared.js';
+import { repairOptics } from '../camera-optics.js';
+import { repairReview } from '../shot-review.js';
+import { heldReport, resolveOverShot } from './shot-held.js';
 
 const id = StudioSchemas.TargetGuard.properties.targetId;
 const TAKE_FRAME_MAX = 28800;
@@ -28,13 +31,16 @@ const extra = [
   mutation('shot.set', 'Set shot fields', elementSetSchema('shot')),
   mutation('shot.setCamera', 'Set camera block', input({ shotId: id, patch: { type: 'object', properties: {}, additionalProperties: true } })),
   mutation('shot.addKey', 'Add camera key', input({ shotId: id, frame })),
+  { ...mutation('shot.recordKeys', 'Record camera performance', input({ shotId: id, keys: { type: 'array', maxItems: 600, items: { type: 'object', properties: {}, additionalProperties: true } } })), exposure: 'ui-only' },
+  { ...mutation('shot.setOptics', 'Set shot optics', input({ shotId: id, optics: { type: 'object', properties: {}, additionalProperties: true } })), exposure: 'ui-only' },
+  { ...mutation('shot.setReview', 'Set shot review', input({ shotId: id, review: { type: 'object', properties: {}, additionalProperties: true } })), exposure: 'ui-only' },
   mutation('shot.moveKey', 'Move camera key', input({ shotId: id, keyId: id, frame })),
   mutation('shot.removeKey', 'Remove camera key', input({ shotId: id, keyId: id })),
   mutation('shot.clearKeys', 'Clear camera keys', input({ shotId: id })),
   mutation('shot.setTimeline', 'Set shot timeline', input({ frameCount: { type: 'integer', minimum: 24, maximum: TAKE_FRAME_MAX } })),
   mutation('shot.setLens', 'Set camera lens', input({ fovDeg: { ...number, minimum: 14, maximum: 90 } })),
   mutation('shot.frame', 'Frame the shot', { ...input({ ...STUDIO_TOOL_SCHEMAS.frame_shot.properties, preset: { type: 'string' } }, []), oneOf: [STUDIO_TOOL_SCHEMAS.frame_shot, input({ preset: { type: 'string' } })] },
-    'Frame a shot on one character (the frame_shot tool): framing.intent { size, level, view, side, focalMm } or framing.exact { position, lookAt, focalMm }. Without keyAtFrame a shot that holds one framing is reframed whole: a held shot. keyAtFrame adds a camera key there; every key eases in and out, so the camera slows to a stop at each one: key a pan or zoom from one spot with two keys (its start and end), lay a moving camera as a rail (shot.setCameraRail) and cut to a new shot for a new view. On a rail shot it puts the shot back on keys. Answers checks { derivedSize, screenFraction, clipped, behindCamera, occluded, cameraSide } for the subject at that frame.'),
+    'Frame a shot on one character (the frame_shot tool): framing.intent { size, level, view, side, focalMm } or framing.exact { position, lookAt, focalMm }. Without keyAtFrame a shot that holds one framing is reframed whole: a held shot. keyAtFrame adds a camera key there; every key eases in and out, so the camera slows to a stop at each one: key a pan or zoom from one spot with two keys (its start and end), lay a moving camera as a rail (shot.setCameraRail) and cut to a new shot for a new view. On a rail shot it puts the shot back on keys. over: "shot" (with intent, after a take is installed) fits one held camera to every pose of the shot and turns it off the asked view only as far as walls need. Answers checks { derivedSize, screenFraction, clipped, behindCamera, occluded, cameraSide } for the subject at that frame, and checks.held { frames, hidden, outOfFrame, askedDeg, chosenDeg } and a HELD_SHOT warning for what a camera holding still misses over the shot.'),
   { ...mutation('shot.replace', 'Replace shot authoring', input({ shots: { type: 'array', items: { type: 'object', properties: {}, additionalProperties: true } } })), exposure: 'ui-only' },
   { ...mutation('shot.captureCamera', 'Capture camera framing', input({ shotId: id }, [])), exposure: 'ui-only' },
   // The Board's Stylize result (or null to clear it). UI-only: the picture has
@@ -97,7 +103,8 @@ export function register(registry, ports) {
     if (added) ports.publishView({ selection, view: { ...view, frame: added.startFrame }, shotId: added.id });
   }
   function duplicate(shotId) {
-    const source = shotOf(shotId), copied = { kind: source.kind, caption: source.caption, cast: structuredClone(source.cast), stylizedAssetId: source.stylizedAssetId };
+    const source = shotOf(shotId), copied = { kind: source.kind, caption: source.caption, cast: structuredClone(source.cast), stylizedAssetId: source.stylizedAssetId,
+      ...(source.optics ? { optics: structuredClone(source.optics) } : {}), ...(source.review ? { review: structuredClone(source.review) } : {}) };
     if (source.kind !== 'still') {
       const before = owner().read(), next = duplicateShot(before, shotId, owner().state().frameCount);
       return owner().write(next.map(shot => before.includes(shot) ? shot : { ...shot, ...copied }));
@@ -176,6 +183,14 @@ export function register(registry, ports) {
       patchShot(shotId, row => ({ ...row, camera: updateCameraBlock(row.camera, { mode }) }));
     },
     'shot.setCamera': ({ shotId, patch }) => patchShot(shotId, shot => ({ ...shot, camera: updateCameraBlock(shot.camera, patch) })),
+    'shot.recordKeys': ({ shotId, keys }) => {
+      shotOf(shotId);
+      if (!keys.length) fail('INVALID_ARGUMENT', 'A recording must contain at least one camera key.');
+      patchShot(shotId, row => ({ ...row, camera: updateCameraBlock(row.camera, { mode: 'keys' }),
+        cameraKeys: keys.map(key => ({ id: row.cameraKeys.find(current => current.frame === key.frame)?.id ?? createStableItemId('camera-key'), frame: key.frame, framing: key.framing })) }));
+    },
+    'shot.setOptics': ({ shotId, optics }) => patchShot(shotId, shot => ({ ...shot, optics: repairOptics(optics) })),
+    'shot.setReview': ({ shotId, review }) => patchShot(shotId, shot => ({ ...shot, review: repairReview(review, shot) })),
     'shot.addKey': ({ shotId, frame }) => {
       const shot = shotOf(shotId), target = Math.min(owner().state().frameCount - 1, frame);
       if (target < shot.startFrame || target > shot.endFrame) return;
@@ -225,10 +240,11 @@ export function register(registry, ports) {
   });
   // frame_shot answers what it measured, and what its keys do to a move.
   function framed(args) {
-    const before = owner().read(), plan = owner().frame(args), shot = owner().read().find(row => row.id === plan.details.shotId);
+    const raw = ports.readView(), before = owner().read(), { args: resolved, held: over } = resolveOverShot(args, { raw, shots: before, ports });
+    const plan = owner().frame(resolved), shot = owner().read().find(row => row.id === plan.details.shotId), report = heldReport(plan, shot, { raw, ports, over });
     const wasRail = createCameraBlock(before.find(row => row.id === shot.id)?.camera).mode === 'rail';
     return { affectedIds: plan.affectedIds, summary: `Framed ${shotLabel(shot)}: ${plan.checks.derivedSize} at frame ${plan.details.frame}, ${shot.cameraKeys.length} camera key${shot.cameraKeys.length === 1 ? '' : 's'}.`.slice(0, 240),
-      checks: plan.checks, warnings: [...plan.warnings, ...(wasRail ? [{ code: 'RAIL_REPLACED', id: shot.id, message: 'This shot is back on camera keys; its rail no longer drives it. Re-lay it with shot.setCameraRail.' }] : []),
+      checks: { ...plan.checks, ...(report.held ? { held: report.held } : {}) }, warnings: [...plan.warnings, ...(report.warning ? [report.warning] : []), ...(wasRail ? [{ code: 'RAIL_REPLACED', id: shot.id, message: 'This shot is back on camera keys; its rail no longer drives it. Re-lay it with shot.setCameraRail.' }] : []),
         ...cameraKeyWarnings(shot)] };
   }
   if (ports.storeDomain?.('shot')) registry.registerToolAlias('frame_shot', 'shot.frame');
